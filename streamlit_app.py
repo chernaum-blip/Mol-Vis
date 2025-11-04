@@ -3,31 +3,19 @@ import gzip
 from typing import List, Tuple, Set
 import streamlit as st
 import py3Dmol
-from Bio.PDB import PDBList, PDBParser
+import urllib.request
 
-st.set_page_config(page_title="Protein–Ligand H-Bond Explorer", layout="wide")
-
-# ---------------- UI: sidebar controls ----------------
-st.sidebar.title("Protein–Ligand H-Bond Explorer")
-pdb_id_default = st.sidebar.text_input("PDB ID (e.g. 1HEW, 3PTB, 6Y2F)", "3PTB").strip().upper()
-uploaded = st.sidebar.file_uploader("...or upload a .pdb file", type=["pdb"])
-cutoff = st.sidebar.slider("H-bond cutoff (Å)", min_value=2.5, max_value=4.0, value=3.5, step=0.1)
-use_tube = st.sidebar.checkbox("Use tube fallback (if cartoon fails)", value=False)
-show_disulfides = st.sidebar.checkbox("Show disulfide bonds (SG–SG ≤ 2.2 Å)", value=True)
-run_btn = st.sidebar.button("Render")
-
-st.title("🧬 Protein–Ligand H-Bond Explorer")
-st.caption("Ribbon protein + ligand sticks + automatic hydrogen bonds and residue labels.")
-
-# ---------------- Data fetch ----------------
 def fetch_pdb_text(pdb_id: str) -> str:
-    pdbl = PDBList()
-    path = pdbl.retrieve_pdb_file(pdb_id, pdir='.', file_format='pdb')
-    if path.endswith(".gz"):
-        with gzip.open(path, 'rt') as f:
-            return f.read()
-    with open(path) as f:
-        return f.read()
+    """Download PDB text directly from RCSB."""
+    pdb_id = pdb_id.strip().upper()
+    url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        # Show a friendly error inside the app and re-raise to stop render
+        st.error(f"Could not download PDB {pdb_id} from RCSB: {e}")
+        raise
 
 def parse_structure_atoms(pdb_text: str):
     parser = PDBParser(QUIET=True)
@@ -208,3 +196,4 @@ st.markdown("""---
 • Adjust the hydrogen-bond cutoff to explore more/less interactions.  
 • Use *Use tube fallback* if cartoons don’t render on your device.
 """)
+
