@@ -4,18 +4,37 @@ from typing import List, Tuple, Set
 import streamlit as st
 import py3Dmol
 import urllib.request
+import pandas as pd
 
+# Optional speedup (falls back gracefully if missing)
+try:
+    from scipy.spatial import cKDTree as KDTree  # type: ignore
+    HAVE_KDTREE = True
+except Exception:
+    HAVE_KDTREE = False
+
+# Biopython
+from Bio.PDB import PDBParser
+
+st.set_page_config(page_title="Ligand H-bonds & Disulfides", layout="wide")
+
+# ---------------- Sidebar UI ----------------
+st.sidebar.header("Input")
+uploaded = st.sidebar.file_uploader("Upload a .pdb file", type=["pdb"])
+pdb_id_default = st.sidebar.text_input("...or fetch by PDB ID", value="3PTB").strip()
+cutoff = st.sidebar.slider("H-bond cutoff (Å)", 2.6, 5.0, 3.5, 0.1)
+use_tube = st.sidebar.toggle("Use tube fallback", value=False)
+show_disulfides = st.sidebar.toggle("Show disulfides", value=True)
+run_btn = st.sidebar.button("Render / Recompute")
+
+# ---------------- Helpers ----------------
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_pdb_text(pdb_id: str) -> str:
     """Download PDB text directly from RCSB."""
     pdb_id = pdb_id.strip().upper()
     url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
-    try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return resp.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        # Show a friendly error inside the app and re-raise to stop render
-        st.error(f"Could not download PDB {pdb_id} from RCSB: {e}")
-        raise
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
 
 def parse_structure_atoms(pdb_text: str):
     parser = PDBParser(QUIET=True)
@@ -44,7 +63,7 @@ def elem_of(a):
 
 def d2(a, b):
     v = a.get_vector() - b.get_vector()
-    return v * v
+    return v * v  # dot product (squared distance)
 
 def bonded_residue_key(atom):
     res = atom.get_parent()
@@ -54,16 +73,31 @@ def compute_hbonds_and_ss(pdb_text: str, cutoff_ang: float = 3.5):
     protein_atoms, ligand_atoms, cys_sg, structure = parse_structure_atoms(pdb_text)
     lig_NO   = [a for a in ligand_atoms if elem_of(a) in ("N","O")]
     prot_NOS = [a for a in protein_atoms if elem_of(a) in ("N","O","S")]
-    cut2 = cutoff_ang ** 2
 
     hbonds: List[Tuple] = []
     bonded_residues: Set[Tuple[str,int,str]] = set()
-    for la in lig_NO:
-        for pa in prot_NOS:
-            if d2(la, pa) <= cut2:
-                hbonds.append((la, pa))
-                bonded_residues.add(bonded_residue_key(pa))
+    cut2 = cutoff_ang ** 2
 
+    if HAVE_KDTREE and lig_NO and prot_NOS:
+        # Build KD-tree on protein N/O/S atoms
+        prot_xyz = [(float(a.coord[0]), float(a.coord[1]), float(a.coord[2])) for a in prot_NOS]
+        tree = KDTree(prot_xyz)
+        for la in lig_NO:
+            q = (float(la.coord[0]), float(la.coord[1]), float(la.coord[2]))
+            idxs = tree.query_ball_point(q, r=cutoff_ang)
+            for i in idxs:
+                pa = prot_NOS[i]
+                if d2(la, pa) <= cut2:
+                    hbonds.append((la, pa))
+                    bonded_residues.add(bonded_residue_key(pa))
+    else:
+        for la in lig_NO:
+            for pa in prot_NOS:
+                if d2(la, pa) <= cut2:
+                    hbonds.append((la, pa))
+                    bonded_residues.add(bonded_residue_key(pa))
+
+    # Disulfides (SG···SG within ~2.2 Å)
     ss_pairs = []
     ss2 = 2.2 ** 2
     for i in range(len(cys_sg)):
@@ -120,17 +154,26 @@ def render_view(pdb_text: str, cutoff_ang: float = 3.5, use_tube=False, show_ss=
         view.addResLabels({"chain": ch, "resi": int(resi)},
                           {"fontColor": "white", "fontSize": 12, "backgroundOpacity": 0.6})
 
-    view.zoomTo({"sel": "protein"})
+    # Correct zoom: protein == not a HET
+    view.zoomTo({"hetflag": False})
     return view, hbonds, bonded_residues, ss_pairs
 
 # ---------------- Load input ----------------
 if uploaded is not None:
-    pdb_text = uploaded.read().decode("utf-8", errors="ignore")
-    source = f"Uploaded file: {uploaded.name}"
+    try:
+        pdb_text = uploaded.read().decode("utf-8", errors="ignore")
+        source = f"Uploaded file: {uploaded.name}"
+    except Exception as e:
+        st.error(f"Could not read uploaded file: {e}")
+        st.stop()
 else:
-    pdb_id = pdb_id_default if pdb_id_default else "3PTB"
-    pdb_text = fetch_pdb_text(pdb_id)
-    source = f"RCSB PDB ID: {pdb_id}"
+    try:
+        pdb_id = pdb_id_default if pdb_id_default else "3PTB"
+        pdb_text = fetch_pdb_text(pdb_id)
+        source = f"RCSB PDB ID: {pdb_id.upper()}"
+    except Exception as e:
+        st.error(f"Could not download PDB {pdb_id_default}: {e}")
+        st.stop()
 
 # Trigger render automatically or on button
 if (uploaded is not None) or run_btn or ("_ran_once" not in st.session_state):
@@ -151,7 +194,8 @@ if (uploaded is not None) or run_btn or ("_ran_once" not in st.session_state):
     with col1:
         st.subheader("Hydrogen-bonded residues (protein side)")
         if bonded_residues:
-            rows = [{"chain": ch, "resi": resi, "resn": resn} for (ch, resi, resn) in sorted(bonded_residues, key=lambda x: (x[0], x[1]))]
+            rows = [{"chain": ch, "resi": resi, "resn": resn}
+                    for (ch, resi, resn) in sorted(bonded_residues, key=lambda x: (x[0], x[1]))]
             st.dataframe(rows, hide_index=True, use_container_width=True)
         else:
             st.info("No H-bonded residues found at this cutoff. Try a larger cutoff.")
@@ -173,9 +217,6 @@ if (uploaded is not None) or run_btn or ("_ran_once" not in st.session_state):
                     "distance_A": float(dist),
                 })
             st.dataframe(rows, hide_index=True, use_container_width=True)
-
-            # CSV download
-            import pandas as pd
             df = pd.DataFrame(rows)
             st.download_button(
                 "Download H-bond table (CSV)",
@@ -196,4 +237,3 @@ st.markdown("""---
 • Adjust the hydrogen-bond cutoff to explore more/less interactions.  
 • Use *Use tube fallback* if cartoons don’t render on your device.
 """)
-
