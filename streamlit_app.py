@@ -1,5 +1,4 @@
 import io
-import gzip
 from typing import List, Tuple, Set
 import streamlit as st
 import py3Dmol
@@ -237,3 +236,4 @@ st.markdown("""---
 • Adjust the hydrogen-bond cutoff to explore more/less interactions.  
 • Use *Use tube fallback* if cartoons don’t render on your device.
 """)
+
